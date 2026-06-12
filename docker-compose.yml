@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cloud_risk_postgres
+    environment:
+      POSTGRES_USER: clouduser
+      POSTGRES_PASSWORD: cloudpass
+      POSTGRES_DB: cloud_risk
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clouduser -d cloud_risk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./backend
+    container_name: cloud_risk_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://clouduser:cloudpass@db:5432/cloud_risk
+      ALLOWED_ORIGINS: "http://localhost:5173,http://localhost:3000"
+      API_KEY: dev-secret-key
+      JWT_SECRET_KEY: change-this-before-deploying
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:

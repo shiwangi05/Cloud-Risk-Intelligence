@@ -1,0 +1,146 @@
+Here's a comprehensive prompt you can paste directly into Claude Code (or any coding agent like Codex):
+
+---
+
+```
+You are working on a full-stack Cloud Risk Intelligence Platform.
+Stack: FastAPI + SQLAlchemy + SQLite (backend), React + Vite (frontend).
+
+Fix ALL of the following issues in one pass:
+
+---
+
+## BACKEND FIXES
+
+### 1. Remove duplicate endpoints
+- DELETE the `/add-resource` and `/add-connection` POST routes from `main.py`
+- DELETE the `/all-data` GET route from `main.py`
+- All resource/connection CRUD must live ONLY in `routers/resources.py`
+- Update `frontend/src/api/client.js` to point to the correct router paths
+
+### 2. Fix broken connection router endpoint
+- In `routers/resources.py`, the `create_connection` function uses `conn.source_id` and `conn.target_id` which do not exist on `ResourceConnectionCreate`
+- Fix it to resolve integer IDs from `conn.from_node` and `conn.to_node` (string UIDs), matching the logic in the old `main.py` `add_connection` endpoint
+- Also add duplicate edge detection
+
+### 3. Implement the missing /chat endpoint
+- Add `POST /chat` to `main.py`
+- It receives `{"message": str}` and returns `{"reply": str}`
+- Implement a rule-based intent handler that covers these cases (query the DB for real data):
+  - "most risky" / "highest risk" → query resources, return the top 3 by risk_score
+  - "blast radius" / "what happens if" / "if X fails" → parse the resource UID from the message, call graph_engine.get_blast_radius()
+  - "attack path" / "simulate attack" → parse the start node UID, call the attack path DFS logic
+  - "total cost" / "cost" → sum all resource costs from DB
+  - "how many" / "count" → return total resources and connections
+  - "high risk" / "critical" → list resources with risk_score >= 70
+  - fallback → return a helpful message listing what the bot can answer
+- All replies must be formatted as human-readable strings with newlines and bullet points
+
+### 4. Recompute risk_score on resource update
+- In `routers/resources.py`, the `update_resource` PUT endpoint must recompute `risk_score` after applying field updates
+- Reuse the `_compute_risk_score()` logic (move it to a shared utility or `graph_engine.py`)
+
+### 5. Fix duplicate risk alert generation
+- In `routers/risks.py`, the `_auto_detect_risks()` function inserts `critical_hub` and `over_privileged` alerts every time alerts are fetched
+- Add deduplication checks for ALL alert types before inserting (check resource_id + alert_type + resolved==0)
+
+### 6. Fix GraphNode schema mismatch
+- In `routers/graph.py`, the `get_graph` endpoint constructs `GraphNode` objects but does NOT populate `sensitivity` and `public_access` fields
+- Fix the node construction to include all required fields from `schemas.GraphNode`
+
+### 7. Move config to environment variables
+- Create a `backend/.env` file with:
+  DATABASE_URL=sqlite:///./cloud_risk.db
+  ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
+- Update `database.py` to read `DATABASE_URL` from environment using `python-dotenv`
+- Update `main.py` CORS middleware to read `ALLOWED_ORIGINS` from environment (split by comma)
+- Add `python-dotenv` to `requirements.txt`
+
+### 8. Add pagination to list endpoints
+- In `routers/resources.py`, add `skip: int = 0` and `limit: int = 100` query params to `list_resources` and `list_connections`
+- Apply `.offset(skip).limit(limit)` to the queries
+
+### 9. Cache the NetworkX graph per request
+- In `graph_engine.py`, the graph is rebuilt from DB on every single call
+- Add a simple in-memory LRU cache (use `functools.lru_cache` or a module-level dict keyed by a DB row count + last updated timestamp) so repeated calls within the same second reuse the built graph
+- Invalidate the cache whenever a resource or connection is added/updated/deleted
+
+### 10. Add basic API key authentication
+- Add a middleware or dependency in `main.py` that checks for an `X-API-Key` header
+- The valid key is read from the `API_KEY` environment variable (add it to `.env`)
+- If the header is missing or wrong, return HTTP 401
+- Exempt the `GET /` health check route from auth
+- Document the key in a new `backend/README.md`
+
+---
+
+## FRONTEND FIXES
+
+### 11. Fix API client paths
+- In `frontend/src/api/client.js`:
+  - Change `addResource` to POST `/api/resources/`
+  - Change `addConnection` to POST `/api/resources/connections/`
+  - Change `getAllData` to GET `/all-data` (keep this one, it still exists in main.py as a convenience route — or rebuild it in the router and update accordingly)
+  - Add the `X-API-Key` header to every axios request, reading the key from `import.meta.env.VITE_API_KEY`
+
+### 12. Add error boundaries to all pages
+- Create `frontend/src/components/ErrorBoundary.jsx` as a React class component
+- Wrap each page component in `App.jsx` with `<ErrorBoundary>`
+- Display a friendly error card with the error message instead of a blank crash
+
+### 13. Show loading and empty states
+- In `AllData.jsx`, `RiskAnalysis.jsx`, and `GraphDashboard.jsx`:
+  - Show a spinner/loading indicator while data is fetching
+  - Show a friendly empty state message when the API returns an empty array
+  - Show an error message if the API call fails (don't silently swallow errors)
+
+### 14. Add environment config for frontend
+- Create `frontend/.env` with:
+  VITE_API_KEY=dev-secret-key
+- Use `import.meta.env.VITE_API_KEY` in the axios client
+
+---
+
+## REPO HYGIENE
+
+### 15. Add .gitignore files
+- Create `backend/.gitignore` that ignores:
+  __pycache__/, *.pyc, venv/, .env, *.db, *.db-shm, *.db-wal
+- Create `frontend/.gitignore` that ignores:
+  node_modules/, dist/, .env, .env.local
+
+### 16. Add requirements.txt corrections
+- Ensure `backend/requirements.txt` includes:
+  fastapi, uvicorn, sqlalchemy, pydantic, networkx, reportlab, python-dotenv
+- Pin versions where possible
+
+---
+
+## TESTING
+
+### 17. Add basic backend tests
+- Create `backend/test_main.py` using `pytest` and `httpx` (FastAPI TestClient)
+- Write tests for:
+  - POST /api/resources/ → creates a resource and returns 201
+  - POST /api/resources/ with duplicate resource_uid → returns 400
+  - GET /api/graph/ → returns valid nodes/edges structure
+  - POST /chat with "total cost" message → returns a reply string
+  - POST /api/resources/connections/ with missing node → returns 404
+- Add `pytest` and `httpx` to requirements.txt
+
+---
+
+## CONSTRAINTS
+- Do NOT change the database schema (models.py) — keep all existing columns
+- Do NOT change the existing React page filenames or routes in App.jsx
+- Keep all existing working features intact
+- After all fixes, the app must start with `uvicorn main:app --reload` (backend) and `npm run dev` (frontend) with zero errors
+```
+
+---
+
+This prompt is structured so a coding agent can work through it top-to-bottom with clear acceptance criteria for each fix. If you're using Claude Code specifically, you can also prepend:
+
+```
+Read all files in the backend/ and frontend/src/ directories first before making any changes.
+```
