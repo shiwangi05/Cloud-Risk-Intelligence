@@ -78,4 +78,10 @@ const getRiskConfig    = ()      => api.get('/admin/risk-config')
 const updateRiskConfig = (data)  => api.put('/admin/risk-config', data)
 export { getRiskConfig, updateRiskConfig }
 
+export const approveAgentRun = (runId, note = '') =>
+  api.post(`/api/agent/runs/${runId}/approval`, { approved: true, note })
+
+export const rejectAgentRun = (runId, note = '') =>
+  api.post(`/api/agent/runs/${runId}/approval`, { approved: false, note })
+
 export default api

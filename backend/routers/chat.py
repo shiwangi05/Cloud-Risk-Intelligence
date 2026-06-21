@@ -16,7 +16,7 @@ import re
 import urllib.error
 import urllib.request
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 import graph_engine
@@ -205,6 +205,39 @@ def _call_gemini(message: str, db: Session, history: list | None = None) -> str 
     return text or "AI provider returned an empty answer."
 
 
+def _call_gemini_json(prompt: str, db: Session) -> dict | None:
+    """Request a low-temperature structured decision; failures use local policy."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": f"{_live_context(db)}\n\n{prompt}"}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        text = "".join(
+            part.get("text", "")
+            for part in body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        ).strip()
+        return json.loads(text)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, IndexError):
+        return None
+
+
 # ── Safe math evaluator ────────────────────────────────────────────────────────
 
 _ALLOWED_MATH_OPS = {
@@ -361,16 +394,31 @@ def _local_general_reply(message: str) -> str:
 
 # ── Route handlers ─────────────────────────────────────────────────────────────
 
+AGENT_NAME = "ARIA"   # Autonomous Risk Intelligence Agent
+AGENT_VERSION = "1.0"
+
 def _should_run_agent(message: str) -> bool:
     lowered = message.lower()
     return any(term in lowered for term in [
-        "agent", "agentic", "investigate", "triage", "security review",
+        "aria", "agent", "agentic", "investigate", "triage", "security review",
         "remediation plan", "analyze everything", "full risk review",
         "autonomous", "root cause", "prioritize risks",
     ])
 
 
-def _agent_plan(message: str) -> list[dict]:
+_AGENT_TOOLS = {
+    "inventory_summary": "Summarize assets, exposure, sensitivity, connections, and cost.",
+    "risk_prioritizer": "Rank the highest-risk resources.",
+    "graph_intelligence": "Inspect graph density, components, and central resources.",
+    "alert_triage": "Summarize unresolved alerts by severity.",
+    "attack_path_analyzer": "Trace downstream paths from a resource named in the goal.",
+    "cost_impact": "Estimate downstream monthly cost impact from a named resource.",
+    "remediation_planner": "Create dry-run remediation proposals requiring approval.",
+}
+_MAX_AGENT_STEPS = 5
+
+
+def _fallback_agent_plan(message: str) -> list[dict]:
     lowered = message.lower()
     plan = [
         {"tool": "inventory_summary", "reason": "Establish asset, edge, cost, and exposure context."},
@@ -385,7 +433,71 @@ def _agent_plan(message: str) -> list[dict]:
     return plan
 
 
-def _run_agent_tool(tool: str, db: Session, resources: list[models.CloudResource], connections: list[models.ResourceConnection], graph) -> dict:
+def _agent_memory(message: str, db: Session) -> list[dict]:
+    """Retrieve a few prior runs with overlapping goal terms."""
+    terms = {term for term in re.findall(r"[a-z0-9-]+", message.lower()) if len(term) > 3}
+    candidates = db.query(models.AgentRun).order_by(models.AgentRun.created_at.desc()).limit(20).all()
+    ranked = []
+    for run in candidates:
+        overlap = len(terms & set(re.findall(r"[a-z0-9-]+", run.goal.lower())))
+        if overlap:
+            ranked.append((overlap, run))
+    return [
+        {
+            "run_id": run.id,
+            "goal": run.goal,
+            "status": run.status,
+            "findings": (run.findings or [])[:3],
+            "recommendations": (run.recommendations or [])[:3],
+        }
+        for _, run in sorted(ranked, key=lambda item: (item[0], item[1].id), reverse=True)[:3]
+    ]
+
+
+def _agent_plan(message: str, db: Session, memory: list[dict]) -> list[dict]:
+    prompt = (
+        "You are planning a cloud-risk investigation. Return JSON with a 'plan' array. "
+        "Each item must contain 'tool' and 'reason'. Use only these tools: "
+        f"{json.dumps(_AGENT_TOOLS)}. Use no more than {_MAX_AGENT_STEPS} tools. "
+        "Prefer the smallest plan that can satisfy the goal. Tools are read-only; remediation_planner only drafts changes.\n"
+        f"Goal: {message}\nRelevant prior runs: {json.dumps(memory)}"
+    )
+    decision = _call_gemini_json(prompt, db)
+    raw_plan = decision.get("plan", []) if isinstance(decision, dict) else []
+    plan = [
+        {"tool": item.get("tool"), "reason": str(item.get("reason", "Selected for the investigation."))[:300]}
+        for item in raw_plan
+        if isinstance(item, dict) and item.get("tool") in _AGENT_TOOLS
+    ][:_MAX_AGENT_STEPS]
+    return plan or _fallback_agent_plan(message)[:_MAX_AGENT_STEPS]
+
+
+def _next_agent_decision(message: str, plan: list[dict], steps: list[dict], db: Session) -> dict:
+    remaining = [item for item in plan if item["tool"] not in {step["tool"] for step in steps}]
+    prompt = (
+        "Act as a bounded cloud-risk agent. Return one JSON object. Choose either "
+        "{'action':'tool','tool':'allowed_name','reason':'...'} or "
+        "{'action':'finish','reason':'why the goal is satisfied'}. You may revise the original plan by selecting "
+        f"another allowed tool, but never repeat a tool. Allowed tools: {json.dumps(_AGENT_TOOLS)}.\n"
+        f"Goal: {message}\nOriginal plan: {json.dumps(plan)}\nObservations: {json.dumps(steps)}"
+    )
+    decision = _call_gemini_json(prompt, db)
+    used = {step["tool"] for step in steps}
+    if (
+        isinstance(decision, dict)
+        and decision.get("action") == "tool"
+        and decision.get("tool") in _AGENT_TOOLS
+        and decision.get("tool") not in used
+    ):
+        return decision
+    if isinstance(decision, dict) and decision.get("action") == "finish" and steps:
+        return decision
+    if remaining:
+        return {"action": "tool", **remaining[0]}
+    return {"action": "finish", "reason": "The planned evidence has been collected and the goal can be answered."}
+
+
+def _run_agent_tool(tool: str, goal: str, db: Session, resources: list[models.CloudResource], connections: list[models.ResourceConnection], graph) -> dict:
     if tool == "inventory_summary":
         total_cost = sum(resource.cost or 0 for resource in resources)
         public_count = sum(1 for resource in resources if resource.public_access)
@@ -415,10 +527,28 @@ def _run_agent_tool(tool: str, db: Session, resources: list[models.CloudResource
         severity_text = ", ".join(f"{severity}: {count}" for severity, count in sorted(by_severity.items())) or "none"
         return {"tool": tool, "status": "completed", "finding": f"There are {len(alerts)} open alerts. Severity breakdown: {severity_text}."}
 
+    if tool in {"attack_path_analyzer", "cost_impact"}:
+        resource = _find_resource_in_message(goal, resources)
+        if not resource:
+            return {"tool": tool, "status": "completed", "finding": "No resource UID or name was present in the goal, so targeted impact analysis could not run."}
+        paths = _attack_paths_from(db, resource)
+        impacted_ids = {node_id for path in paths for node_id in path[1:]}
+        impacted = [item for item in resources if item.id in impacted_ids]
+        if tool == "attack_path_analyzer":
+            finding = f"{resource.resource_uid} has {len(paths)} downstream attack paths reaching {len(impacted)} unique resources."
+        else:
+            cost = sum(item.cost or 0 for item in impacted)
+            finding = f"Failure of {resource.resource_uid} could affect {len(impacted)} downstream resources with ${cost:,.2f} in monthly cost."
+        return {"tool": tool, "status": "completed", "finding": finding}
+
     if tool == "remediation_planner":
         recommendations = _recommendations(resources, graph)
         finding = "Recommended actions: " + " ".join(recommendations[:5]) if recommendations else "No automatic remediation candidates were found from current inventory signals."
-        return {"tool": tool, "status": "needs_approval", "finding": finding}
+        proposals = [
+            {"mode": "dry_run", "proposal": item.lstrip("- "), "requires_approval": True}
+            for item in recommendations[:5]
+        ]
+        return {"tool": tool, "status": "needs_approval", "finding": finding, "proposals": proposals}
 
     return {"tool": tool, "status": "skipped", "finding": "Unknown tool was skipped."}
 
@@ -440,8 +570,21 @@ def _handle_agentic_chat(req: schemas.ChatRequest, db: Session) -> schemas.ChatR
     resources = db.query(models.CloudResource).all()
     connections = db.query(models.ResourceConnection).all()
     graph = graph_engine.build_graph(db)
-    plan = _agent_plan(req.message)
-    steps = [_run_agent_tool(item["tool"], db, resources, connections, graph) for item in plan]
+    memory = _agent_memory(req.message, db)
+    plan = _agent_plan(req.message, db, memory)
+    steps = []
+    completion_reason = "The safety iteration limit was reached."
+    while len(steps) < _MAX_AGENT_STEPS:
+        decision = _next_agent_decision(req.message, plan, steps, db)
+        if decision.get("action") == "finish":
+            completion_reason = str(decision.get("reason", "Investigation complete."))[:500]
+            break
+        tool = decision["tool"]
+        if tool not in {item["tool"] for item in plan}:
+            plan.append({"tool": tool, "reason": str(decision.get("reason", "Added after observing tool results."))[:300]})
+        step = _run_agent_tool(tool, req.message, db, resources, connections, graph)
+        step["iteration"] = len(steps) + 1
+        steps.append(step)
     findings = [step["finding"] for step in steps]
     recommendations = _agent_recommendations(resources, graph)
     approval_required = any(step["status"] == "needs_approval" for step in steps) or bool(recommendations)
@@ -460,27 +603,36 @@ def _handle_agentic_chat(req: schemas.ChatRequest, db: Session) -> schemas.ChatR
     db.refresh(run)
 
     lines = [
-        f"Agentic investigation completed (run #{run.id}):",
-        "- Goal interpreted: " + req.message,
-        "- Plan selected:",
+        f"ARIA (Autonomous Risk Intelligence Agent) — Run #{run.id}",
+        f"Goal: {req.message}",
+        "",
+        "Plan:",
     ]
-    lines += [f"  - {item['tool']}: {item['reason']}" for item in plan]
-    lines.append("- Tool results:")
-    lines += [f"  - {step['tool']}: {step['finding']}" for step in steps]
+    lines += [f"  [{i+1}] {item['tool']}: {item['reason']}" for i, item in enumerate(plan)]
+    lines.append("")
+    lines.append("Tool Results:")
+    lines += [f"  [{step['iteration']}] {step['tool']} ({step['status']}): {step['finding']}" for step in steps]
     if recommendations:
-        lines.append("- Recommended next actions:")
+        lines.append("")
+        lines.append("ARIA Recommendations (require human approval):")
         lines += [f"  - {item}" for item in recommendations]
-    lines.append("- Human approval: required before any remediation or infrastructure change.")
-    lines.append("- Agent memory: this investigation was saved in /api/agent/runs.")
+    lines.append("")
+    lines.append(f"Completion: {completion_reason}")
+    lines.append(f"Memory: Investigation saved as run #{run.id} in /api/agent/runs.")
 
     return schemas.ChatResponse(
         reply="\n".join(lines),
         agent={
+            "name": AGENT_NAME,
+            "version": AGENT_VERSION,
             "run_id": run.id,
             "plan": plan,
             "steps": steps,
             "recommendations": recommendations,
             "approval_required": approval_required,
+            "completion_reason": completion_reason,
+            "iterations": len(steps),
+            "memory_used": memory,
         },
     )
 
@@ -607,8 +759,23 @@ def _handle_chat(req: schemas.ChatRequest, db: Session) -> schemas.ChatResponse:
         return schemas.ChatResponse(reply="\n".join(lines))
 
     if "total cost" in message or "cost" in message:
-        total_cost = sum(resource.cost or 0 for resource in resources)
-        return schemas.ChatResponse(reply=f"Total cloud cost:\n- ${total_cost:,.2f} per month across {len(resources)} resources.")
+        # Check if the user is asking about a SPECIFIC resource first
+        target = _find_resource_in_message(message, resources)
+        if target:
+            connections_count = graph.degree(target.id) if target.id in graph else 0
+            return schemas.ChatResponse(reply="\n".join([
+                f"Cost details for {target.resource_uid} ({target.name}):",
+                f"- Monthly cost: ${target.cost or 0:,.2f}",
+                f"- Provider: {target.provider} / {target.region}",
+                f"- Risk score: {target.risk_score or 0:.1f}",
+                f"- Connections: {connections_count}",
+            ]))
+        # No specific resource mentioned — return total
+        total_cost = sum(r.cost or 0 for r in resources)
+        breakdown = sorted(resources, key=lambda r: r.cost or 0, reverse=True)[:5]
+        lines = [f"Total cloud cost:", f"- ${total_cost:,.2f} per month across {len(resources)} resources.", "", "Top 5 by cost:"]
+        lines += [f"- {r.resource_uid} ({r.name}): ${r.cost or 0:,.2f}" for r in breakdown]
+        return schemas.ChatResponse(reply="\n".join(lines))
 
     if "how many" in message or "count" in message:
         return schemas.ChatResponse(reply=f"Inventory count:\n- Resources: {len(resources)}\n- Connections: {len(connections)}")
@@ -673,3 +840,177 @@ def list_agent_runs(skip: int = 0, limit: int = 25, db: Session = Depends(get_db
         .limit(limit)
         .all()
     )
+
+
+@router.post("/api/agent/runs/{run_id}/approval", response_model=schemas.AgentRunOut)
+def decide_agent_run(run_id: int, req: schemas.AgentApprovalRequest, db: Session = Depends(get_db)):
+    """Record a human decision and, on approval, auto-execute ARIA's recommendations."""
+    run = db.query(models.AgentRun).filter(models.AgentRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if not run.approval_required:
+        raise HTTPException(status_code=409, detail="This agent run has no approval-gated proposals")
+
+    executed_actions: list[str] = []
+
+    if req.approved:
+        executed_actions = _execute_approved_recommendations(run, db)
+        finding = (
+            f"Plan approved. {len(executed_actions)} action(s) executed automatically: "
+            + "; ".join(executed_actions)
+        ) if executed_actions else "Plan approved. No automated changes were applicable."
+    else:
+        finding = req.note or "Proposals rejected by human reviewer. No changes made."
+
+    steps = list(run.steps or [])
+    steps.append({
+        "tool": "human_approval",
+        "status": "approved" if req.approved else "rejected",
+        "finding": finding,
+        "executed_actions": executed_actions,
+    })
+    run.steps = steps
+    run.status = "approved" if req.approved else "rejected"
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+# ── Auto-execution engine ──────────────────────────────────────────────────────
+
+def _execute_approved_recommendations(run: models.AgentRun, db) -> list[str]:
+    """
+    Parse each ARIA recommendation and apply the matching DB change.
+
+    Supported actions (parsed from recommendation text):
+      - "remove public exposure from {uid}"     → resource.public_access = False
+      - "tighten IAM"  / "encryption validation" → RiskAlert (encryption_review)
+      - "segment" / "segmentation"              → RiskAlert (network_segmentation)
+      - "backups" / "recovery"                  → RiskAlert (backup_review)
+    After any resource change, risk scores are recomputed and an AuditLog entry written.
+    """
+    resources = db.query(models.CloudResource).all()
+    uid_to_res = {r.resource_uid: r for r in resources}
+    executed: list[str] = []
+
+    for rec in (run.recommendations or []):
+        lowered = rec.lower()
+
+        # ── Action 1: Remove public exposure ──────────────────────────────
+        m = re.search(r'remove public exposure from ([\w-]+)', lowered)
+        if m:
+            uid = m.group(1).upper().replace("-", "-")
+            # Try both original and uppercase match
+            resource = uid_to_res.get(m.group(1)) or _fuzzy_uid(uid_to_res, m.group(1))
+            if resource and resource.public_access:
+                resource.public_access = False
+                _write_audit(db, "UPDATE", "CloudResource", resource.id,
+                             resource.resource_uid, f"ARIA auto-exec: set public_access=False")
+                executed.append(f"Disabled public access on {resource.resource_uid} ({resource.name})")
+            continue
+
+        # ── Action 2: Encryption / IAM review alert ───────────────────────
+        if any(k in lowered for k in ["encryption", "iam", "access review"]):
+            uid_match = re.search(r'for ([\w-]+)', lowered)
+            if uid_match:
+                resource = _fuzzy_uid(uid_to_res, uid_match.group(1))
+                if resource and not _alert_exists(db, resource.id, "encryption_review"):
+                    alert = models.RiskAlert(
+                        resource_id=resource.id,
+                        alert_type="encryption_review",
+                        severity="high",
+                        title=f"[ARIA] Encryption & IAM Review: {resource.name}",
+                        description=f"Auto-created by ARIA on plan approval. Resource {resource.resource_uid} requires encryption validation and IAM tightening.",
+                    )
+                    db.add(alert)
+                    _write_audit(db, "CREATE", "RiskAlert", resource.id,
+                                 resource.resource_uid, "ARIA auto-exec: created encryption_review alert")
+                    executed.append(f"Created encryption_review alert for {resource.resource_uid} ({resource.name})")
+            continue
+
+        # ── Action 3: Network segmentation alert ──────────────────────────
+        if any(k in lowered for k in ["segment", "network path"]):
+            uid_match = re.search(r'resource ([\w-]+)', lowered)
+            if uid_match:
+                resource = _fuzzy_uid(uid_to_res, uid_match.group(1))
+                if resource and not _alert_exists(db, resource.id, "network_segmentation"):
+                    alert = models.RiskAlert(
+                        resource_id=resource.id,
+                        alert_type="network_segmentation",
+                        severity="medium",
+                        title=f"[ARIA] Network Segmentation Review: {resource.name}",
+                        description=f"Auto-created by ARIA on plan approval. Highly connected resource {resource.resource_uid} needs segmentation review.",
+                    )
+                    db.add(alert)
+                    _write_audit(db, "CREATE", "RiskAlert", resource.id,
+                                 resource.resource_uid, "ARIA auto-exec: created network_segmentation alert")
+                    executed.append(f"Created network_segmentation alert for {resource.resource_uid} ({resource.name})")
+            continue
+
+        # ── Action 4: Backup / recovery review alert ──────────────────────
+        if any(k in lowered for k in ["backup", "recovery"]):
+            uid_match = re.search(r'([\w-]{3,})', lowered)
+            # grab first UID-like token from the recommendation text
+            uid_match = re.search(r'\b([A-Z][\w-]{2,})\b', rec)
+            if uid_match:
+                resource = _fuzzy_uid(uid_to_res, uid_match.group(1))
+                if resource and not _alert_exists(db, resource.id, "backup_review"):
+                    alert = models.RiskAlert(
+                        resource_id=resource.id,
+                        alert_type="backup_review",
+                        severity="medium",
+                        title=f"[ARIA] Backup & Recovery Review: {resource.name}",
+                        description=f"Auto-created by ARIA on plan approval. Resource {resource.resource_uid} requires backup and recovery priority confirmation.",
+                    )
+                    db.add(alert)
+                    _write_audit(db, "CREATE", "RiskAlert", resource.id,
+                                 resource.resource_uid, "ARIA auto-exec: created backup_review alert")
+                    executed.append(f"Created backup_review alert for {resource.resource_uid} ({resource.name})")
+            continue
+
+    # Recompute risk scores for all affected resources if any changes made
+    if executed:
+        graph_engine.compute_risk_analysis(db)  # persists updated scores
+
+    db.commit()
+    return executed
+
+
+def _fuzzy_uid(uid_map: dict, token: str) -> models.CloudResource | None:
+    """Case-insensitive resource UID lookup with partial match fallback."""
+    token_lower = token.lower()
+    # Exact match first
+    for uid, res in uid_map.items():
+        if uid.lower() == token_lower:
+            return res
+    # Prefix match
+    for uid, res in uid_map.items():
+        if uid.lower().startswith(token_lower) or token_lower.startswith(uid.lower()):
+            return res
+    # Name match
+    for uid, res in uid_map.items():
+        if token_lower in res.name.lower():
+            return res
+    return None
+
+
+def _alert_exists(db, resource_id: int, alert_type: str) -> bool:
+    """Return True if an open alert of this type already exists for the resource."""
+    return db.query(models.RiskAlert).filter(
+        models.RiskAlert.resource_id == resource_id,
+        models.RiskAlert.alert_type == alert_type,
+        models.RiskAlert.resolved == False,  # noqa: E712
+    ).first() is not None
+
+
+def _write_audit(db, action: str, entity_type: str, entity_id: int, entity_uid: str, detail: str):
+    """Write an immutable audit log entry for ARIA-executed actions."""
+    import json as _json
+    log = models.AuditLog(
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_uid=entity_uid,
+        detail=_json.dumps({"source": "ARIA_auto_exec", "detail": detail}),
+    )
+    db.add(log)

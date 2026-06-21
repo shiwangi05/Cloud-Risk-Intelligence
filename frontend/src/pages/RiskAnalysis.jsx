@@ -3,9 +3,9 @@ import { getRiskAnalysis, getReport } from '../api/client'
 import toast from 'react-hot-toast'
 
 const levelColor = {
-  High:   { badge: 'badge-rose',    bar: 'var(--rose)',    glow: 'rgba(251,113,133,0.25)' },
-  Medium: { badge: 'badge-amber',   bar: 'var(--amber)',   glow: 'rgba(251,191,36,0.2)'  },
-  Low:    { badge: 'badge-emerald', bar: 'var(--emerald)', glow: 'rgba(52,211,153,0.15)' },
+  High: { badge: 'badge-rose', bar: 'var(--rose)', glow: 'rgba(251,113,133,0.25)' },
+  Medium: { badge: 'badge-amber', bar: 'var(--amber)', glow: 'rgba(251,191,36,0.2)' },
+  Low: { badge: 'badge-emerald', bar: 'var(--emerald)', glow: 'rgba(52,211,153,0.15)' },
 }
 
 const typeIcon = (t) => ({ Server: '🖥️', Database: '🗄️', Storage: '📦' }[t] || '☁️')
@@ -44,9 +44,9 @@ function ScoreBar({ score, maxScore = 100 }) {
 }
 
 export default function RiskAnalysis() {
-  const [data, setData]       = useState(null)
+  const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError]     = useState(null)
+  const [error, setError] = useState(null)
   const [downloading, setDownloading] = useState(false)
 
   const fetchData = useCallback(async () => {
@@ -107,7 +107,6 @@ export default function RiskAnalysis() {
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
           <h1>Risk Analysis</h1>
-          <p>Every resource scored via the NetworkX graph formula — sorted by highest risk first.</p>
         </div>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <button className="btn btn-primary btn-sm" onClick={handleDownloadReport} disabled={downloading}>

@@ -48,3 +48,9 @@ Set `GEMINI_API_KEY` in `.env` to enable general ChatGPT-style answers through G
 GEMINI_API_KEY=your-google-ai-studio-key
 GEMINI_MODEL=gemini-2.5-flash
 ```
+
+## Agentic Investigations
+
+Ask the chat endpoint to investigate, triage, prioritize risks, or create a remediation plan to start an agent run. The agent uses a bounded plan-act-observe loop with an allowlist of read-only tools and a maximum of five tool calls. Gemini creates and revises structured plans when configured; a deterministic local policy is used when it is unavailable.
+
+Runs and relevant prior-run memory are available from `GET /api/agent/runs`. Remediation output is always a dry run. Record a human decision with `POST /api/agent/runs/{run_id}/approval` and an `{"approved": true|false, "note": "..."}` body. Approval is audited in the run trace but does not execute or mutate infrastructure.

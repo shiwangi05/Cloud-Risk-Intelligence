@@ -141,7 +141,7 @@ export default function Login() {
             justifyContent: 'center',
             fontSize: '1.5rem',
             margin: '0 auto 1rem',
-            boxShadow: '0 8px 32px rgba(34,211,238,0.25)',
+            boxShadow: '0 4px 16px rgba(79,142,247,0.2)',
           }}>
             🛡️
           </div>

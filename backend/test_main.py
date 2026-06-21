@@ -230,7 +230,32 @@ def test_agentic_investigation_creates_run_log():
     assert "Agentic investigation completed" in body["reply"]
     assert body["agent"]["approval_required"] is True
     assert len(body["agent"]["plan"]) >= 3
+    assert 1 <= body["agent"]["iterations"] <= 5
+    assert body["agent"]["completion_reason"]
 
     runs = client.get("/api/agent/runs", headers=auth_headers())
     assert runs.status_code == 200
     assert runs.json()[0]["goal"] == "Run an agentic full risk review and remediation plan"
+
+
+def test_agent_approval_records_decision_without_mutating_resource():
+    payload = sample_resource()
+    payload["public_access"] = True
+    client.post("/api/resources/", json=payload, headers=auth_headers())
+    run = client.post(
+        "/api/chat",
+        json={"message": "Run an agentic remediation plan"},
+        headers=auth_headers(),
+    ).json()["agent"]
+
+    response = client.post(
+        f"/api/agent/runs/{run['run_id']}/approval",
+        json={"approved": True, "note": "Approved for a later maintenance window."},
+        headers=auth_headers(),
+    )
+    resource = client.get("/api/resources/", headers=auth_headers()).json()[0]
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "approved"
+    assert response.json()["steps"][-1]["tool"] == "human_approval"
+    assert resource["public_access"] is True

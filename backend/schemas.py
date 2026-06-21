@@ -198,6 +198,11 @@ class ChatResponse(BaseModel):
     agent: Optional[Dict[str, Any]] = None
 
 
+class AgentApprovalRequest(BaseModel):
+    approved: bool
+    note: Optional[str] = Field(None, max_length=500)
+
+
 class AttackPathDetail(BaseModel):
     path: List[str]
     description: str
